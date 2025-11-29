@@ -1,4 +1,5 @@
 #include <cstring>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -61,8 +62,89 @@ process_input_data(const char *input_data, const int fd, stats *stats)
   return false;
 }
 
+void
+epoll_add(int epoll_fd, int sock_fd, uint32_t events)
+{
+  epoll_event event;
+  event.events = events;
+  event.data.fd = sock_fd;
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock_fd, &event) == -1) {
+    perror("Error in epol_ctl()\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+void
+set_nonblock(int fd)
+{
+  if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) == -1) {
+    perror("Error in fctl()\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+void
+process_new_connection(int listen_socket, int epoll_fd, stats *stats)
+{
+  sockaddr_in client_addr;
+  socklen_t client_socklen = sizeof(client_addr);
+  int client_socket =
+    accept(listen_socket, (struct sockaddr *)&client_addr, &client_socklen);
+ 
+  ++stats->nof_all_connections;
+  ++stats->nof_current_connections;
+  
+  char buf_address[BUF_SIZE];
+  strcpy(buf_address, inet_ntoa(client_addr.sin_addr));
+  std::cout << "New connection from " << buf_address << ":"
+    << ntohs(client_addr.sin_port) << "\n";
+
+  set_nonblock(client_socket);
+
+  epoll_add(epoll_fd, client_socket, EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLHUP);
+}
+
+void
+process_new_data(epoll_event event, stats *stats)
+{
+  while(true) {
+    char read_data[MAX_LINE] = {};
+    int nof_read = read(event.data.fd, read_data,sizeof(read_data));
+    if (nof_read <= 0) {
+      break;
+    } else {
+      struct sockaddr_in client_addr;
+      socklen_t client_addr_size = sizeof(client_addr);
+      getpeername(event.data.fd, (struct sockaddr *)&client_addr, &client_addr_size);
+      char buf_address[BUF_SIZE];
+      strcpy(buf_address, inet_ntoa(client_addr.sin_addr));
+      std::cout << "Message: \"" << read_data << "\" from " << buf_address << ntohs(client_addr.sin_port) <<"\n";
+      
+      bool process_status = process_input_data(read_data, event.data.fd, stats);
+      if (!process_status) {
+        write(event.data.fd, read_data,strlen(read_data));
+      }
+    }
+  }
+}
+
+void
+close_connection(epoll_event event, int epoll_fd, stats *stats)
+{
+  --stats->nof_current_connections;
+
+  struct sockaddr_in client_addr;
+  socklen_t client_addr_size = sizeof(client_addr);
+  getpeername(event.data.fd, (struct sockaddr *)&client_addr,&client_addr_size);
+  char buf_address[BUF_SIZE];
+  strcpy(buf_address, inet_ntoa(client_addr.sin_addr));
+  std::cout << "Connection closed from "<< buf_address << ntohs(client_addr.sin_port) <<"\n";
+  
+  epoll_ctl(epoll_fd, EPOLL_CTL_DEL, event.data.fd, nullptr);
+  close(event.data.fd);
+}
+
 // TODO: задавать порт через входной аргумент
-// TODO: перенести однотипные действия в отдельные функции
 int
 main()
 {
@@ -80,11 +162,7 @@ main()
     exit(EXIT_FAILURE);
   }
 
-  if (fcntl(listen_socket, F_SETFL, 
-      fcntl(listen_socket, F_GETFL, 0) | O_NONBLOCK) == -1) {
-    perror("Error in fctl() for listen socket\n");
-    exit(EXIT_FAILURE);
-  }
+  set_nonblock(listen_socket);
 
   int listen_status = listen(listen_socket, MAX_CONNECTIONS); 
   if (listen_status == -1) {
@@ -94,14 +172,7 @@ main()
   std::cout << "Listen on " << ntohs(server_addr.sin_port) << " for connections...\n";
 
   int epoll = epoll_create(1);
-
-  struct epoll_event ev;
-  ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-  ev.data.fd = listen_socket;
-  if (epoll_ctl(epoll, EPOLL_CTL_ADD, listen_socket, &ev) == -1) {
-    perror("Error in epol_ctl() for listen_socket\n");
-    exit(1);
-  }
+  epoll_add(epoll, listen_socket, EPOLLIN | EPOLLOUT | EPOLLET);
 
   epoll_event events[MAX_EVENTS];
   while (true) {
@@ -109,65 +180,17 @@ main()
     for(int i = 0; i < nof_fds; ++i) {
       // Новое соединение
       if (events[i].data.fd == listen_socket) {
-        sockaddr_in client_addr;
-        socklen_t client_socklen = sizeof(client_addr);
-        int client_socket = accept(listen_socket, (struct sockaddr *)&client_addr, &client_socklen);
-        ++stats.nof_all_connections;
-        ++stats.nof_current_connections;
-        char buf_address[BUF_SIZE];
-        strcpy(buf_address, inet_ntoa(client_addr.sin_addr));
-        std::cout << "New connection from " << buf_address << ":" << ntohs(client_addr.sin_port) << "\n";
-
-        if (fcntl(client_socket, F_SETFL,
-                  fcntl(client_socket, F_GETFL, 0) | O_NONBLOCK) == -1) {
-          perror("Error in fctl() for client_socket\n");
-          exit(EXIT_FAILURE);
-        }
-
-        struct epoll_event ev;
-        ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLHUP;
-        ev.data.fd = client_socket;
-        if (epoll_ctl(epoll, EPOLL_CTL_ADD, client_socket, &ev) == -1) {
-          perror("Error in epol_ctl() for clinet_socket\n");
-          exit(EXIT_FAILURE);
-        }
+        process_new_connection(listen_socket, epoll, &stats);
       }
 
       // Данные
       if (events[i].events & EPOLLIN) {
-        while(true) {
-          char read_data[MAX_LINE] = {};
-          int nof_read = read(events[i].data.fd, read_data,sizeof(read_data));
-          if (nof_read <= 0) {
-            break;
-          } else {
-            struct sockaddr_in client_addr;
-            socklen_t client_addr_size = sizeof(client_addr);
-            getpeername(events[i].data.fd, (struct sockaddr *)&client_addr, &client_addr_size);
-            char buf_address[BUF_SIZE];
-            strcpy(buf_address, inet_ntoa(client_addr.sin_addr));
-            std::cout << "Message: \"" << read_data << "\" from " << buf_address << ntohs(client_addr.sin_port) <<"\n";
-            
-            bool process_status = process_input_data(read_data, events[i].data.fd, &stats);
-            if (!process_status) {
-              write(events[i].data.fd, read_data,strlen(read_data));
-            }
-          }
-        }
+        process_new_data(events[i], &stats);
       } 
 
       // Закрытие соединения
       if (events[i].events & (EPOLLRDHUP | EPOLLHUP)) {
-        --stats.nof_current_connections;
-        struct sockaddr_in client_addr;
-        socklen_t client_addr_size = sizeof(client_addr);
-        getpeername(events[i].data.fd, (struct sockaddr *)&client_addr,&client_addr_size);
-        char buf_address[BUF_SIZE];
-        strcpy(buf_address, inet_ntoa(client_addr.sin_addr));
-        std::cout << "Connection closed from "<< buf_address << ntohs(client_addr.sin_port) <<"\n";
-
-        epoll_ctl(epoll, EPOLL_CTL_DEL,events[i].data.fd, nullptr);
-        close(events[i].data.fd);
+        close_connection(events[i], epoll, &stats);
         continue;
       }
 
